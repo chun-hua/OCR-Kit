@@ -2,6 +2,10 @@
 
 基于 **PP-OCRv6、ONNX Runtime、FastAPI 与 Vue 3** 构建的现代 OCR 工作台。支持图片和 PDF 文档识别、逐页结果展示、检测框与文本联动、实时进度日志以及结果导出。
 
+## 界面预览
+
+![OCR-Kit PDF 逐页识别与文字联动界面](docs/images/ocr-kit-workbench.png)
+
 ## 功能特性
 
 - 图片 OCR：支持 JPG、PNG、WebP、BMP、TIFF 等常见格式
