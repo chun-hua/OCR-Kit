@@ -1,0 +1,14 @@
+# Web API and ASGI server
+fastapi==0.137.1
+uvicorn==0.49.0
+python-multipart==0.0.32
+
+# OCR runtime
+paddleocr==3.7.0
+onnxruntime==1.27.0
+
+# Image, PDF, and numerical processing
+numpy==1.26.4
+scikit-image==0.24.0
+Pillow==12.2.0
+PyMuPDF==1.27.2.3
