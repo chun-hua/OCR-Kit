@@ -1,5 +1,11 @@
 import { ref, computed, shallowRef } from 'vue'
-import { ocrImage, ocrPdf, checkHealth } from '../api/ocr.js'
+import {
+  ocrImage,
+  ocrPdf,
+  checkHealth,
+  getModels,
+  activateModel,
+} from '../api/ocr.js'
 import { connectResultStream } from '../api/sse.js'
 
 /**
@@ -9,7 +15,7 @@ import { connectResultStream } from '../api/sse.js'
  * For PDFs, results are accumulated progressively via SSE — pages appear
  * incrementally as they are processed, rather than all at once at the end.
  */
-export function useOcr() {
+export function useOcr(modelId = ref('tiny'), loadedModelId = null) {
   const file = ref(null)
   const previewUrl = ref(null)
   const loading = ref(false)
@@ -139,7 +145,9 @@ export function useOcr() {
         const apiResult = await ocrPdf(file.value, {
           dpi: dpi.value,
           max_pages: maxPages.value,
+          model: modelId.value,
         })
+        if (loadedModelId && apiResult.model_id) loadedModelId.value = apiResult.model_id
 
         // Merge SSE-accumulated result with the final API response.
         // SSE may have partial data (some pages null), so prefer the API's
@@ -164,7 +172,10 @@ export function useOcr() {
         }
       } else {
         // Single image — fast enough that progressive isn't needed
-        result.value = await ocrImage(file.value)
+        result.value = await ocrImage(file.value, { model: modelId.value })
+        if (loadedModelId && result.value.model_id) {
+          loadedModelId.value = result.value.model_id
+        }
       }
     } catch (e) {
       error.value = e.message
@@ -197,6 +208,57 @@ export function useOcr() {
     // actions
     setFile, run, clear, revokePreview,
   }
+}
+
+/**
+ * Switchable PP-OCRv6 model profile state.
+ */
+export function useModelProfiles() {
+  const STORAGE_KEY = 'ppocr-model-profile'
+  const profiles = ref([])
+  const selectedId = ref(localStorage.getItem(STORAGE_KEY) || 'tiny')
+  const loadedId = ref(null)
+  const switching = ref(false)
+  const error = ref(null)
+
+  async function load() {
+    try {
+      const data = await getModels()
+      profiles.value = data.models || []
+      loadedId.value = data.loaded_model_id || null
+
+      if (!profiles.value.some((profile) => profile.id === selectedId.value)) {
+        selectedId.value = data.selected_model_id || 'tiny'
+        localStorage.setItem(STORAGE_KEY, selectedId.value)
+      }
+    } catch (e) {
+      error.value = e.message
+    }
+  }
+
+  async function select(modelId) {
+    if (switching.value || modelId === loadedId.value) {
+      selectedId.value = modelId
+      localStorage.setItem(STORAGE_KEY, modelId)
+      return
+    }
+
+    switching.value = true
+    error.value = null
+    try {
+      const data = await activateModel(modelId)
+      selectedId.value = data.model_id
+      loadedId.value = data.model_id
+      localStorage.setItem(STORAGE_KEY, data.model_id)
+    } catch (e) {
+      error.value = e.message
+      throw e
+    } finally {
+      switching.value = false
+    }
+  }
+
+  return { profiles, selectedId, loadedId, switching, error, load, select }
 }
 
 /**
