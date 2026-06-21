@@ -35,7 +35,28 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 import uvicorn
+
+from app_config import (
+    PERFORMANCE_PROFILES,
+    apply_runtime_environment,
+    detect_hardware,
+    load_config,
+    public_settings,
+    save_config,
+)
+
+APP_CONFIG = load_config()
+apply_runtime_environment(APP_CONFIG)
+_runtime_warning: str | None = None
+if APP_CONFIG["device"] == "gpu" and not detect_hardware()["cuda_available"]:
+    APP_CONFIG["device"] = "cpu"
+    _runtime_warning = (
+        "配置要求使用 GPU，但当前发行版或驱动未提供 CUDAExecutionProvider，"
+        "本次启动已自动回退到 CPU。"
+    )
 
 # ── Use HF mirror for model downloads ───────────────────────────────
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -55,7 +76,9 @@ _log_queues: list[asyncio.Queue] = []
 _result_queues: list[asyncio.Queue] = []
 
 # Thread pool for CPU-bound OCR work (prevents event-loop blocking)
-_ocr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+_ocr_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=APP_CONFIG["ocr_workers"]
+)
 _loop: asyncio.AbstractEventLoop | None = None  # set after event loop starts
 
 # ── Stage labels ────────────────────────────────────────────────────
@@ -164,9 +187,48 @@ def broadcast_result(data: dict):
     _threadsafe_push(_result_queues, payload)
 
 
-# ── Lazy OCR engine ─────────────────────────────────────────────────
+# ── OCR model profiles + lazy engine ────────────────────────────────
+MODEL_PROFILES = {
+    "tiny": {
+        "id": "tiny",
+        "name": "极速",
+        "tier": "Tiny",
+        "description": "启动和识别最快，适合清晰文档与低配设备",
+        "det_model": "PP-OCRv6_tiny_det",
+        "rec_model": "PP-OCRv6_tiny_rec",
+        "model_size_mb": 6.3,
+        "accuracy": {"detection_hmean": 80.6, "recognition": 73.5},
+    },
+    "small": {
+        "id": "small",
+        "name": "均衡",
+        "tier": "Small",
+        "description": "兼顾速度与精度，推荐用于日常图片和 PDF",
+        "det_model": "PP-OCRv6_small_det",
+        "rec_model": "PP-OCRv6_small_rec",
+        "model_size_mb": 30.0,
+        "accuracy": {"detection_hmean": 84.1, "recognition": 81.3},
+    },
+    "medium": {
+        "id": "medium",
+        "name": "高精度",
+        "tier": "Medium",
+        "description": "精度最高，适合复杂版面、低清图像与生产场景",
+        "det_model": "PP-OCRv6_medium_det",
+        "rec_model": "PP-OCRv6_medium_rec",
+        "model_size_mb": 132.7,
+        "accuracy": {"detection_hmean": 86.2, "recognition": 83.2},
+    },
+}
+DEFAULT_MODEL_ID = os.environ.get("PPOCR_MODEL", APP_CONFIG["default_model"]).lower()
+if DEFAULT_MODEL_ID not in MODEL_PROFILES:
+    logger.warning("Unknown PPOCR_MODEL=%s; falling back to tiny", DEFAULT_MODEL_ID)
+    DEFAULT_MODEL_ID = "tiny"
+
 _ocr = None
-_ocr_lock = threading.Lock()
+_ocr_lock = threading.RLock()
+_selected_model_id = DEFAULT_MODEL_ID
+_loaded_model_id: str | None = None
 
 
 def _make_temp_path(prefix: str, suffix: str = ".png") -> Path:
@@ -176,46 +238,86 @@ def _make_temp_path(prefix: str, suffix: str = ".png") -> Path:
     return Path(path)
 
 
-def get_ocr():
-    """Lazy-init PaddleOCR with PP-OCRv6 ONNX models. Thread-safe."""
-    global _ocr
-    if _ocr is None:
-        with _ocr_lock:
-            if _ocr is None:  # double-check
-                broadcast_log(
-                    "正在加载 PP-OCRv6 模型 (ONNX Runtime)...",
-                    level="info",
-                    stage="init",
-                )
-                t0 = time.time()
-                from paddleocr import PaddleOCR
+def resolve_model_id(model_id: str | None = None) -> str:
+    """Resolve and validate a model profile id."""
+    resolved = (model_id or _selected_model_id).lower()
+    if resolved not in MODEL_PROFILES:
+        raise ValueError(
+            f"Unknown model profile '{resolved}'. "
+            f"Available profiles: {', '.join(MODEL_PROFILES)}"
+        )
+    return resolved
 
-                _ocr = PaddleOCR(
-                    ocr_version="PP-OCRv6",
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    engine="onnxruntime",
-                    lang="ch",
-                )
-                elapsed = time.time() - t0
-                broadcast_log(
-                    f"模型加载完成，耗时 {elapsed:.1f}s",
-                    level="info",
-                    stage="init",
-                    detail={
-                        "elapsed_sec": round(elapsed, 1),
-                        "engine": "onnxruntime",
-                        "version": "PP-OCRv6",
-                    },
-                )
-    return _ocr
+
+def get_ocr(model_id: str | None = None):
+    """Load the requested PP-OCRv6 ONNX profile and make it active."""
+    global _ocr, _selected_model_id, _loaded_model_id
+    resolved_id = resolve_model_id(model_id)
+
+    with _ocr_lock:
+        if _ocr is not None and _loaded_model_id == resolved_id:
+            _selected_model_id = resolved_id
+            return _ocr
+
+        profile = MODEL_PROFILES[resolved_id]
+        broadcast_log(
+            f"正在加载 PP-OCRv6 {profile['tier']} 模型 (ONNX Runtime)...",
+            level="info",
+            stage="init",
+            detail={
+                "model_id": resolved_id,
+                "det_model": profile["det_model"],
+                "rec_model": profile["rec_model"],
+            },
+        )
+        t0 = time.time()
+        from paddleocr import PaddleOCR
+
+        # Build first, then swap the shared engine. If loading fails, the
+        # previously working model remains available.
+        next_ocr = PaddleOCR(
+            text_detection_model_name=profile["det_model"],
+            text_recognition_model_name=profile["rec_model"],
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device=APP_CONFIG["device"],
+            engine="onnxruntime",
+            engine_config={
+                "intra_op_num_threads": APP_CONFIG["cpu_threads"],
+                "inter_op_num_threads": 1,
+                "execution_mode": "sequential",
+            },
+        )
+        _ocr = next_ocr
+        _selected_model_id = resolved_id
+        _loaded_model_id = resolved_id
+
+        elapsed = time.time() - t0
+        broadcast_log(
+            f"{profile['name']}模型加载完成，耗时 {elapsed:.1f}s",
+            level="info",
+            stage="init",
+            detail={
+                "elapsed_sec": round(elapsed, 1),
+                "engine": "onnxruntime",
+                "version": "PP-OCRv6",
+                "model_id": resolved_id,
+                "det_model": profile["det_model"],
+                "rec_model": profile["rec_model"],
+            },
+        )
+        return _ocr
 
 
 # ── OCR processing (run in thread pool) ─────────────────────────────
 
 
-def _ocr_image_bytes(image_bytes: bytes, filename: str = "input.png") -> list:
+def _ocr_image_bytes(
+    image_bytes: bytes,
+    filename: str = "input.png",
+    model_id: str = DEFAULT_MODEL_ID,
+) -> list:
     """Run OCR on raw image bytes. Returns list of page dicts.
 
     This is called in a thread pool — broadcast_log is thread-safe.
@@ -248,7 +350,7 @@ def _ocr_image_bytes(image_bytes: bytes, filename: str = "input.png") -> list:
         )
 
         # ── OCR ──
-        ocr = get_ocr()
+        ocr = get_ocr(model_id)
         broadcast_log("开始文字检测与识别...", level="info", stage="detection")
         results = ocr.predict(str(temp_path))
 
@@ -300,6 +402,7 @@ def _ocr_pdf_bytes(
     filename: str = "document.pdf",
     dpi: int = 200,
     max_pages: int = 0,
+    model_id: str = DEFAULT_MODEL_ID,
 ):
     """Run OCR on PDF bytes. Returns (pages_list, total_pages, processed_pages).
 
@@ -331,7 +434,7 @@ def _ocr_pdf_bytes(
         progress_current=0,
     )
 
-    ocr = get_ocr()
+    ocr = get_ocr(model_id)
     all_pages = []
 
     for page_idx in range(pages_to_process):
@@ -473,6 +576,17 @@ app.add_middleware(
 )
 
 
+class SettingsUpdate(BaseModel):
+    model_dir: str = Field(min_length=1)
+    project_dir: str = Field(min_length=1)
+    performance_profile: str
+    device: str
+    cpu_threads: int = Field(ge=1, le=64)
+    ocr_workers: int = Field(ge=1, le=4)
+    default_model: str
+    open_browser: bool = True
+
+
 # ── SSE: Log Stream ─────────────────────────────────────────────────
 @app.get("/ocr/logs")
 async def ocr_logs(request: Request):
@@ -561,17 +675,113 @@ async def ocr_results(request: Request):
 # ── Health ──────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "onnxruntime", "model": "PP-OCRv6"}
+    selected = MODEL_PROFILES[_selected_model_id]
+    return {
+        "status": "ok",
+        "application": "OCR-Kit",
+        "engine": "onnxruntime",
+        "device": APP_CONFIG["device"],
+        "model": f"PP-OCRv6 {selected['tier']}",
+        "model_id": _selected_model_id,
+        "loaded_model_id": _loaded_model_id,
+        "model_loaded": _ocr is not None,
+        "warning": _runtime_warning,
+    }
+
+
+@app.get("/settings")
+async def get_settings():
+    """Return persistent application settings and detected hardware."""
+    return {
+        "settings": public_settings(APP_CONFIG),
+        "hardware": detect_hardware(),
+    }
+
+
+@app.put("/settings")
+async def update_settings(payload: SettingsUpdate):
+    """Persist settings. Runtime-sensitive changes take effect after restart."""
+    global APP_CONFIG
+
+    if payload.performance_profile not in PERFORMANCE_PROFILES:
+        raise HTTPException(400, "Unknown performance profile")
+    if payload.device not in {"cpu", "gpu"}:
+        raise HTTPException(400, "Device must be cpu or gpu")
+    if payload.default_model not in MODEL_PROFILES:
+        raise HTTPException(400, "Unknown default model")
+    if payload.device == "gpu" and not detect_hardware()["cuda_available"]:
+        raise HTTPException(
+            400,
+            "当前运行环境没有可用的 CUDAExecutionProvider，请安装 GPU 发行版并确认 NVIDIA 驱动兼容。",
+        )
+
+    previous = APP_CONFIG
+    APP_CONFIG = save_config({**APP_CONFIG, **payload.model_dump()})
+    restart_fields = {
+        "model_dir",
+        "project_dir",
+        "performance_profile",
+        "device",
+        "cpu_threads",
+        "ocr_workers",
+        "default_model",
+    }
+    restart_required = any(
+        previous.get(field) != APP_CONFIG.get(field) for field in restart_fields
+    )
+    return {
+        "status": "success",
+        "settings": public_settings(APP_CONFIG),
+        "restart_required": restart_required,
+    }
+
+
+@app.get("/ocr/models")
+async def ocr_models():
+    """List switchable PP-OCRv6 profiles and current backend state."""
+    return {
+        "models": list(MODEL_PROFILES.values()),
+        "selected_model_id": _selected_model_id,
+        "loaded_model_id": _loaded_model_id,
+    }
+
+
+@app.post("/ocr/models/{model_id}/activate")
+async def activate_ocr_model(model_id: str):
+    """Preload and activate a model profile without running OCR."""
+    try:
+        resolved_id = resolve_model_id(model_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_ocr_executor, get_ocr, resolved_id)
+        profile = MODEL_PROFILES[resolved_id]
+        return {
+            "status": "success",
+            "model_id": resolved_id,
+            "model": f"PP-OCRv6 {profile['tier']}",
+            "det_model": profile["det_model"],
+            "rec_model": profile["rec_model"],
+        }
+    except Exception as exc:
+        logger.exception("Model activation failed")
+        raise HTTPException(500, f"Model activation failed: {str(exc)}") from exc
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
 @app.post("/ocr/image")
-async def ocr_image(file: UploadFile = File(...)):
+async def ocr_image(
+    file: UploadFile = File(...),
+    model: str | None = Query(None, description="Model profile: tiny, small, medium"),
+):
     """OCR on a single image. Returns texts, scores, and bounding boxes."""
     if not (file.content_type and file.content_type.startswith("image/")):
         raise HTTPException(400, "File must be an image")
 
     try:
+        model_id = resolve_model_id(model)
         image_bytes = await file.read()
         loop = asyncio.get_running_loop()
         pages = await loop.run_in_executor(
@@ -579,9 +789,12 @@ async def ocr_image(file: UploadFile = File(...)):
             _ocr_image_bytes,
             image_bytes,
             file.filename or "input.png",
+            model_id,
         )
-        return {"status": "success", "pages": pages}
+        return {"status": "success", "model_id": model_id, "pages": pages}
 
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except Exception as e:
         broadcast_log(
             f"OCR 失败: {str(e)}",
@@ -598,6 +811,7 @@ async def ocr_pdf(
     file: UploadFile = File(...),
     dpi: int = Query(200, ge=72, le=600, description="Render DPI"),
     max_pages: int = Query(0, ge=0, description="Max pages (0=all)"),
+    model: str | None = Query(None, description="Model profile: tiny, small, medium"),
 ):
     """OCR on a PDF. Each page is rendered at the given DPI and OCR'd.
 
@@ -607,6 +821,7 @@ async def ocr_pdf(
         raise HTTPException(400, "File must be a PDF")
 
     try:
+        model_id = resolve_model_id(model)
         pdf_bytes = await file.read()
         loop = asyncio.get_running_loop()
         all_pages, total_pages, pages_to_process = await loop.run_in_executor(
@@ -616,14 +831,18 @@ async def ocr_pdf(
             file.filename or "document.pdf",
             dpi,
             max_pages,
+            model_id,
         )
         return {
             "status": "success",
+            "model_id": model_id,
             "total_pages": total_pages,
             "processed_pages": pages_to_process,
             "pages": all_pages,
         }
 
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except Exception as e:
         broadcast_log(
             f"PDF OCR 失败: {str(e)}",
@@ -637,9 +856,12 @@ async def ocr_pdf(
 
 
 @app.post("/ocr/text")
-async def ocr_text(file: UploadFile = File(...)):
+async def ocr_text(
+    file: UploadFile = File(...),
+    model: str | None = Query(None, description="Model profile: tiny, small, medium"),
+):
     """OCR on an image, returning concatenated plain text."""
-    result = await ocr_image(file)
+    result = await ocr_image(file, model)
     all_text = []
     for page in result.get("pages", []):
         all_text.extend(page.get("texts", []))
@@ -652,6 +874,20 @@ async def startup():
     global _loop
     _loop = asyncio.get_running_loop()
     logger.info(f"Event loop captured for thread-safe SSE broadcast")
+    if _runtime_warning:
+        logger.warning(_runtime_warning)
+
+
+def _frontend_dist_path() -> Path:
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / "frontend" / "dist"
+
+
+_frontend_dist = _frontend_dist_path()
+if _frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+else:
+    logger.warning("Frontend build not found at %s", _frontend_dist)
 
 
 # ── Entry point ─────────────────────────────────────────────────────

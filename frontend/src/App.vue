@@ -1,7 +1,8 @@
 <template>
   <div class="app">
     <!-- Toolbar -->
-    <StatusBar :status="healthStatus" :info="healthInfo" />
+    <StatusBar :status="healthStatus" :info="healthInfo" @settings="settingsOpen = true" />
+    <SettingsDialog :open="settingsOpen" @close="settingsOpen = false" />
 
     <!-- Main layout -->
     <main class="main-layout">
@@ -12,6 +13,15 @@
           <h1>文档识别工作台</h1>
           <p class="app-desc">导入图像或 PDF，执行高精度版面识别与文字提取。</p>
         </div>
+
+        <ModelSwitcher
+          :models="models.profiles.value"
+          :selected-id="models.selectedId.value"
+          :loaded-id="models.loadedId.value"
+          :switching="models.switching.value"
+          :disabled="ocr.loading.value"
+          @select="onSelectModel"
+        />
 
         <FileUpload
           :file="ocr.file.value"
@@ -30,12 +40,12 @@
 
         <!-- Error display -->
         <Transition name="slide-up">
-          <div v-if="ocr.error.value" class="error-banner" role="alert" aria-live="assertive">
+          <div v-if="ocr.error.value || models.error.value" class="error-banner" role="alert" aria-live="assertive">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round">
               <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
             </svg>
-            <span>{{ ocr.error.value }}</span>
+            <span>{{ ocr.error.value || models.error.value }}</span>
           </div>
         </Transition>
 
@@ -131,13 +141,17 @@ import OverlayResult from './components/OverlayResult.vue'
 import PdfResult    from './components/PdfResult.vue'
 import LogPanel     from './components/LogPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
-import { useOcr, useHealth } from './composables/useOcr.js'
+import ModelSwitcher from './components/ModelSwitcher.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
+import { useOcr, useHealth, useModelProfiles } from './composables/useOcr.js'
 import { useHistory }        from './composables/useHistory.js'
 
-const ocr = useOcr()
+const models = useModelProfiles()
+const ocr = useOcr(models.selectedId, models.loadedId)
 const { status: healthStatus, info: healthInfo, check: checkHealth } = useHealth()
 const history = useHistory()
 const logPanelRef = ref(null)
+const settingsOpen = ref(false)
 
 // ── History state ──────────────────────────────────
 const activeHistoryId = ref(null)
@@ -176,7 +190,17 @@ function onClear() {
   activeHistoryId.value = null
 }
 
+async function onSelectModel(modelId) {
+  try {
+    await models.select(modelId)
+    await checkHealth()
+  } catch {
+    // Model switch errors are rendered in the shared error banner.
+  }
+}
+
 onMounted(() => {
+  models.load()
   checkHealth()
   setInterval(checkHealth, 60_000)
 })

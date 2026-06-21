@@ -1,13 +1,16 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const apiTarget = process.env.OCR_API_TARGET || 'http://localhost:8765'
+const devPort = Number(process.env.VITE_PORT || 5173)
+
 export default defineConfig({
   plugins: [vue()],
   server: {
-    port: 5173,
+    port: devPort,
     proxy: {
-      '/ocr': 'http://localhost:8765',
-      '/health': 'http://localhost:8765',
+      '/ocr': apiTarget,
+      '/health': apiTarget,
     },
   },
 })

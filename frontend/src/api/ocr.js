@@ -40,15 +40,56 @@ export async function checkHealth() {
   return res.json()
 }
 
+/** List available PP-OCRv6 model profiles. */
+export async function getModels() {
+  const res = await fetch(`${BASE}/ocr/models`)
+  if (!res.ok) throw new Error(`Failed to load model profiles: ${res.status}`)
+  return res.json()
+}
+
+/** Preload and activate a model profile. */
+export async function activateModel(modelId) {
+  const res = await fetch(`${BASE}/ocr/models/${encodeURIComponent(modelId)}/activate`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Model switch failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+/** Read persistent desktop settings and detected hardware. */
+export async function getSettings() {
+  const res = await fetch(`${BASE}/settings`)
+  if (!res.ok) throw new Error(`Failed to load settings: ${res.status}`)
+  return res.json()
+}
+
+/** Save persistent desktop settings. */
+export async function updateSettings(settings) {
+  const res = await fetch(`${BASE}/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Failed to save settings: ${res.status}`)
+  }
+  return res.json()
+}
+
 /**
  * OCR an image file. Returns full result with texts, scores, boxes.
  * @param {File} file
  * @returns {Promise<OcrResult>}
  */
-export async function ocrImage(file) {
+export async function ocrImage(file, { model = 'tiny' } = {}) {
   const form = new FormData()
   form.append('file', file)
-  const res = await fetch(`${BASE}/ocr/image`, { method: 'POST', body: form })
+  const params = new URLSearchParams({ model })
+  const res = await fetch(`${BASE}/ocr/image?${params}`, { method: 'POST', body: form })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || `OCR failed: ${res.status}`)
@@ -59,13 +100,17 @@ export async function ocrImage(file) {
 /**
  * OCR a PDF file.
  * @param {File} file
- * @param {{ dpi?: number, max_pages?: number }} [opts]
+ * @param {{ dpi?: number, max_pages?: number, model?: string }} [opts]
  * @returns {Promise<OcrResult>}
  */
-export async function ocrPdf(file, { dpi = 200, max_pages = 0 } = {}) {
+export async function ocrPdf(file, { dpi = 200, max_pages = 0, model = 'tiny' } = {}) {
   const form = new FormData()
   form.append('file', file)
-  const params = new URLSearchParams({ dpi: String(dpi), max_pages: String(max_pages) })
+  const params = new URLSearchParams({
+    dpi: String(dpi),
+    max_pages: String(max_pages),
+    model,
+  })
   const res = await fetch(`${BASE}/ocr/pdf?${params}`, { method: 'POST', body: form })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
